@@ -13,11 +13,12 @@ from tqdm import tqdm
 import re
 import csv
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 import statistics
 import yaml
 import os
-from typing import Dict, Any
+from typing import Dict, Any, Optional
+import psutil
 
 # Initialize logger at module level
 logger = logging.getLogger(__name__)
@@ -46,6 +47,90 @@ def setup_logging(config: Dict[str, Any]) -> None:
         handlers=handlers
     )
 
+class CrawlerStats:
+    """Class to track and manage detailed crawler statistics."""
+    
+    def __init__(self):
+        self.start_time = datetime.now()
+        self.last_stats_update = self.start_time
+        self.pages_crawled = 0
+        self.crawl_rates = []  # pages per minute
+        self.memory_usage = []  # MB
+        self.response_times = []
+        self.errors = {
+            'timeout': 0,
+            'connection': 0,
+            'http': 0,
+            'parse': 0,
+            'other': 0
+        }
+        self.content_types = {}
+        self.status_codes = {}
+        self.timing_stats = {
+            'fetch': [],
+            'parse': [],
+            'save': []
+        }
+
+    def update_crawl_rate(self, pages_crawled: int, elapsed_seconds: float):
+        """Update pages crawled per minute."""
+        if elapsed_seconds > 0:
+            rate = (pages_crawled * 60) / elapsed_seconds
+            self.crawl_rates.append(rate)
+
+    def update_memory_usage(self):
+        """Update memory usage statistics."""
+        process = psutil.Process()
+        memory_mb = process.memory_info().rss / 1024 / 1024
+        self.memory_usage.append(memory_mb)
+
+    def get_summary(self) -> Dict[str, Any]:
+        """Get comprehensive statistics summary."""
+        end_time = datetime.now()
+        elapsed_time = (end_time - self.start_time).total_seconds()
+        
+        return {
+            'timing': {
+                'start_time': self.start_time.isoformat(),
+                'end_time': end_time.isoformat(),
+                'elapsed_seconds': elapsed_time
+            },
+            'progress': {
+                'pages_crawled': self.pages_crawled,
+                'average_crawl_rate': statistics.mean(self.crawl_rates) if self.crawl_rates else 0,
+                'current_crawl_rate': self.crawl_rates[-1] if self.crawl_rates else 0
+            },
+            'performance': {
+                'memory_usage_mb': {
+                    'current': self.memory_usage[-1] if self.memory_usage else 0,
+                    'average': statistics.mean(self.memory_usage) if self.memory_usage else 0,
+                    'peak': max(self.memory_usage) if self.memory_usage else 0
+                },
+                'response_times': {
+                    'average': statistics.mean(self.response_times) if self.response_times else 0,
+                    'median': statistics.median(self.response_times) if self.response_times else 0,
+                    'p95': statistics.quantiles(self.response_times, n=20)[-1] if len(self.response_times) >= 20 else None
+                }
+            },
+            'errors': self.errors,
+            'content_types': self.content_types,
+            'status_codes': self.status_codes,
+            'timing_stats': {
+                'fetch': {
+                    'average': statistics.mean(self.timing_stats['fetch']) if self.timing_stats['fetch'] else 0,
+                    'median': statistics.median(self.timing_stats['fetch']) if self.timing_stats['fetch'] else 0
+                },
+                'parse': {
+                    'average': statistics.mean(self.timing_stats['parse']) if self.timing_stats['parse'] else 0,
+                    'median': statistics.median(self.timing_stats['parse']) if self.timing_stats['parse'] else 0
+                },
+                'save': {
+                    'average': statistics.mean(self.timing_stats['save']) if self.timing_stats['save'] else 0,
+                    'median': statistics.median(self.timing_stats['save']) if self.timing_stats['save'] else 0
+                }
+            }
+        }
+
 class SeoCrawler:
     def __init__(self, config: Dict[str, Any]):
         """Initialize crawler with configuration dictionary."""
@@ -63,8 +148,29 @@ class SeoCrawler:
         # Compile skip patterns
         self.skip_patterns = re.compile('|'.join(config['http']['skip_patterns']))
         
-        self.visited = set()
-        self.queue = deque([self.start_url])
+        # Checkpoint configuration
+        self.checkpoint_enabled = config['checkpoint']['enabled']
+        self.checkpoint_interval = config['checkpoint']['interval']
+        self.checkpoint_file = config['checkpoint']['file']
+        self.keep_checkpoint = config['checkpoint']['keep_on_complete']
+        
+        # Progress tracking configuration
+        self.progress_config = config['progress']
+        self.stats_interval = config['progress']['stats_interval']
+        
+        # Initialize statistics
+        self.stats = CrawlerStats()
+        
+        # Load or initialize state
+        self.state = self.load_checkpoint() if self.checkpoint_enabled else None
+        if self.state:
+            self.visited = self.state['visited']
+            self.queue = self.state['queue']
+            self.stats.pages_crawled = len(self.visited)
+        else:
+            self.visited = set()
+            self.queue = deque([self.start_url])
+        
         self.lock = threading.Lock()
         self.session = requests.Session()
         self.stats = {
@@ -97,7 +203,7 @@ class SeoCrawler:
     def setup_db(self):
         """Initialize or update SQLite database with multiple heading columns."""
         with self.database_connection() as conn:
-            # Create table with base columns if it doesn't exist
+            # Create main pages table
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS pages (
                     url TEXT PRIMARY KEY,
@@ -114,8 +220,24 @@ class SeoCrawler:
                     error TEXT
                 )
             """)
+
+            # Create links table for internal link structure
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS links (
+                    source_url TEXT,
+                    target_url TEXT,
+                    link_text TEXT,
+                    is_followed BOOLEAN,
+                    link_type TEXT,
+                    discovered_at TIMESTAMP,
+                    PRIMARY KEY (source_url, target_url),
+                    FOREIGN KEY (source_url) REFERENCES pages(url),
+                    FOREIGN KEY (target_url) REFERENCES pages(url)
+                )
+            """)
+            
             # Add heading columns (h1_1, h1_2, ..., h6_5)
-            for level in range(1, 7):  # H1 to H6
+            for level in range(1, 7):
                 for i in range(1, self.max_headings_per_level + 1):
                     column_name = f"h{level}_{i}"
                     try:
@@ -160,7 +282,7 @@ class SeoCrawler:
             if not self.is_html_content(response):
                 return None
 
-            soup = BeautifulSoup(response.text, 'lxml')  # Using lxml for better performance
+            soup = BeautifulSoup(response.text, 'lxml')
 
             # Basic metadata
             title = soup.title.string.strip() if soup.title else "No Title"
@@ -201,7 +323,8 @@ class SeoCrawler:
                 'images': json.dumps(images),
                 'last_crawled': datetime.now().isoformat(),
                 'error': None,
-                'links': []
+                'links': [],
+                'links_data': []  # Enhanced link data
             }
 
             # Extract headings
@@ -211,13 +334,20 @@ class SeoCrawler:
                     column_name = f"h{level}_{i}"
                     result[column_name] = headings[i-1] if i <= len(headings) else f"No H{level}-{i}"
 
-            # Extract links
-            result['links'] = [
-                self.normalize_url(urljoin(url, link['href']))
-                for link in soup.find_all('a', href=True)
-                if urlparse(urljoin(url, link['href'])).netloc == urlparse(self.start_url).netloc
-                and not self.should_skip_url(link['href'])
-            ]
+            # Enhanced link extraction
+            for link in soup.find_all('a', href=True):
+                target_url = self.normalize_url(urljoin(url, link['href']))
+                # Only process internal links
+                if urlparse(target_url).netloc == urlparse(self.start_url).netloc:
+                    link_data = {
+                        'url': target_url,
+                        'text': link.get_text(strip=True),
+                        'followed': not self.should_skip_url(target_url),
+                        'type': 'internal'
+                    }
+                    if not self.should_skip_url(target_url):
+                        result['links'].append(target_url)
+                    result['links_data'].append(link_data)
 
             return result
 
@@ -246,7 +376,8 @@ class SeoCrawler:
             'images': json.dumps([]),
             'last_crawled': datetime.now().isoformat(),
             'error': error_message,
-            'links': []
+            'links': [],
+            'links_data': []
         }
 
     def should_skip_url(self, url):
@@ -254,34 +385,81 @@ class SeoCrawler:
         return bool(self.skip_patterns.search(url))
 
     def save_results(self, results):
-        """Batch save results to the database with multiple heading columns."""
+        """Batch save results to the database."""
         with self.database_connection() as conn:
-            columns = ["url", "status", "title", "description", "canonical", "word_count", "images"]
+            # Save page data
+            pages_columns = ["url", "status", "response_time", "content_type", "title", 
+                           "description", "canonical", "robots_meta", "word_count", 
+                           "images", "last_crawled", "error"]
+            
+            # Add heading columns
             for level in range(1, 7):
                 for i in range(1, self.max_headings_per_level + 1):
-                    columns.append(f"h{level}_{i}")
-            placeholders = ",".join("?" * len(columns))
-            query = f"INSERT OR REPLACE INTO pages ({','.join(columns)}) VALUES ({placeholders})"
-            conn.executemany(query, [
-                tuple(r[col] for col in columns) for r in results
-            ])
+                    pages_columns.append(f"h{level}_{i}")
+            
+            pages_placeholders = ",".join("?" * len(pages_columns))
+            pages_query = f"INSERT OR REPLACE INTO pages ({','.join(pages_columns)}) VALUES ({pages_placeholders})"
+            
+            # Prepare links data
+            links_data = []
+            for result in results:
+                # Extract page data
+                page_data = [result[col] for col in pages_columns]
+                conn.execute(pages_query, page_data)
+                
+                # Process links
+                source_url = result['url']
+                for link in result.get('links_data', []):
+                    links_data.append((
+                        source_url,
+                        link['url'],
+                        link['text'],
+                        link['followed'],
+                        link['type'],
+                        datetime.now().isoformat()
+                    ))
+            
+            # Batch insert links
+            if links_data:
+                conn.executemany("""
+                    INSERT OR REPLACE INTO links 
+                    (source_url, target_url, link_text, is_followed, link_type, discovered_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, links_data)
+            
             conn.commit()
 
     def export_to_csv(self):
-        """Export database contents to CSV file."""
-        csv_file = self.config['output']['csv_file']
+        """Export database contents to CSV files."""
+        # Export pages
+        pages_file = self.config['output']['csv_file']
+        links_file = pages_file.replace('.csv', '_links.csv')
+        
         with self.database_connection() as conn:
             cursor = conn.cursor()
+            
+            # Export pages
             cursor.execute("SELECT * FROM pages")
             rows = cursor.fetchall()
             columns = [desc[0] for desc in cursor.description]
             
-            with open(csv_file, "w", newline="", encoding="utf-8") as f:
+            with open(pages_file, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(columns)
+                writer.writerows(rows)
+            
+            # Export links
+            cursor.execute("SELECT * FROM links")
+            rows = cursor.fetchall()
+            columns = [desc[0] for desc in cursor.description]
+            
+            with open(links_file, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 writer.writerow(columns)
                 writer.writerows(rows)
         
-        logger.info(f"Exported results to {csv_file}")
+        logger.info(f"Exported pages to {pages_file}")
+        logger.info(f"Exported links to {links_file}")
 
     def export_to_json(self):
         """Export database contents to JSON file."""
@@ -331,13 +509,53 @@ class SeoCrawler:
         
         logger.info(f"Crawl report generated: {report_file}")
 
-    def crawl(self):
-        """Main crawl loop with progress bar and CSV export."""
-        self.stats['start_time'] = datetime.now().isoformat()
-        pages_crawled = 0
-        results_buffer = []
+    def save_checkpoint(self):
+        """Save current crawler state to checkpoint file."""
+        if not self.checkpoint_enabled:
+            return
 
-        with tqdm(total=self.max_pages, desc="Crawling", unit="page") as pbar:
+        try:
+            state = {
+                'visited': list(self.visited),
+                'queue': list(self.queue),
+                'stats': self.stats.get_summary()
+            }
+            with open(self.checkpoint_file, 'w') as f:
+                json.dump(state, f)
+            logger.info(f"Checkpoint saved: {len(self.visited)} pages crawled")
+        except Exception as e:
+            logger.error(f"Error saving checkpoint: {e}")
+
+    def update_stats(self):
+        """Update detailed statistics."""
+        if not self.progress_config['track_speed']:
+            return
+
+        now = datetime.now()
+        elapsed = (now - self.stats.last_stats_update).total_seconds()
+        
+        if elapsed >= self.stats_interval:
+            if self.progress_config['track_speed']:
+                self.stats.update_crawl_rate(self.stats.pages_crawled, elapsed)
+            
+            if self.progress_config['track_memory']:
+                self.stats.update_memory_usage()
+            
+            self.stats.last_stats_update = now
+            
+            # Save current statistics to file
+            with open(self.config['output']['stats_file'], 'w') as f:
+                json.dump(self.stats.get_summary(), f, indent=2)
+
+    def crawl(self):
+        """Main crawl loop with enhanced progress tracking and configurable checkpoints."""
+        if not self.stats.start_time:
+            self.stats.start_time = datetime.now()
+        
+        pages_since_checkpoint = 0
+        
+        with tqdm(total=self.max_pages, desc="Crawling", unit="page", 
+                 initial=len(self.visited)) as pbar:
             while self.queue and len(self.visited) < self.max_pages:
                 with self.lock:
                     batch_size = min(self.max_workers, len(self.queue), self.max_pages - len(self.visited))
@@ -361,49 +579,78 @@ class SeoCrawler:
                         try:
                             result = future.result()
                             if result:  # Only process if result is not None
-                                results_buffer.append(result)
+                                self.stats.pages_crawled += 1
+                                pages_since_checkpoint += 1
+                                
+                                if self.progress_config['track_content_types']:
+                                    content_type = result['content_type']
+                                    self.stats.content_types[content_type] = \
+                                        self.stats.content_types.get(content_type, 0) + 1
+                                
+                                if self.progress_config['track_status_codes']:
+                                    status = result['status']
+                                    self.stats.status_codes[status] = \
+                                        self.stats.status_codes.get(status, 0) + 1
+                                
+                                if self.progress_config['track_timing']:
+                                    self.stats.response_times.append(result['response_time'])
+
                                 with self.lock:
                                     self.visited.add(url)
-                                    pages_crawled += 1
                                     for link in result["links"]:
                                         if link not in self.visited and link not in self.queue:
                                             self.queue.append(link)
                                 pbar.update(1)
-                                logger.info(f"Crawled: {url} (Status: {result['status']}) - {pages_crawled}/{self.max_pages}")
+                                logger.info(f"Crawled: {url} (Status: {result['status']}) - {self.stats.pages_crawled}/{self.max_pages}")
                         except Exception as e:
                             logger.error(f"Error processing {url}: {e}")
 
-                # Batch save every 50 results or at the end
-                if len(results_buffer) >= self.batch_size or len(self.visited) >= self.max_pages:
-                    self.save_results(results_buffer)
-                    results_buffer.clear()
+                # Save results to database
+                if urls_to_crawl:
+                    self.save_results(urls_to_crawl)
+
+                # Update statistics
+                self.update_stats()
+
+                # Save checkpoint if needed
+                if self.checkpoint_enabled and pages_since_checkpoint >= self.checkpoint_interval:
+                    self.save_checkpoint()
+                    pages_since_checkpoint = 0
 
                 time.sleep(self.delay)
 
-        # Save any remaining results
-        if results_buffer:
-            self.save_results(results_buffer)
-
-        # Set end time before generating reports
-        self.stats['end_time'] = datetime.now().isoformat()
-
-        # Export to CSV after crawling
-        self.export_to_csv()
-
-        # Generate and save report
-        self.generate_report()
-
-        logger.info(f"Finished crawling {pages_crawled} pages.")
+        # Final cleanup and statistics
+        self.cleanup()
 
     def cleanup(self):
-        """Cleanup resources."""
+        """Enhanced cleanup with final statistics and configurable checkpoint handling."""
         try:
             self.session.close()
-            # Export any remaining data
-            self.stats['end_time'] = datetime.now().isoformat()
+            
+            # Save final statistics
+            self.stats.end_time = datetime.now()
+            final_stats = self.stats.get_summary()
+            
+            with open(self.config['output']['stats_file'], 'w') as f:
+                json.dump(final_stats, f, indent=2)
+            
+            # Save final checkpoint if enabled
+            if self.checkpoint_enabled:
+                self.save_checkpoint()
+                
+                # Remove checkpoint file if crawl completed successfully and keep_checkpoint is False
+                if len(self.visited) >= self.max_pages and not self.keep_checkpoint:
+                    try:
+                        os.remove(self.checkpoint_file)
+                        logger.info("Crawl completed successfully, checkpoint file removed")
+                    except OSError:
+                        pass
+            
+            # Generate reports and exports
             self.generate_report()
             self.export_to_csv()
             self.export_to_json()
+            
         except Exception as e:
             logger.error(f"Error during cleanup: {e}")
 

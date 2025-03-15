@@ -13,6 +13,23 @@ performance:
   timeout: 30  # Request timeout in seconds
   batch_size: 50  # Database batch size
 
+# Checkpoint configuration
+checkpoint:
+  enabled: true
+  interval: 100  # Save checkpoint every N pages
+  file: "crawler_checkpoint.json"
+  keep_on_complete: false  # Whether to keep checkpoint file after successful completion
+
+# Progress tracking
+progress:
+  track_speed: true  # Track crawl speed
+  track_memory: true  # Track memory usage
+  track_errors: true  # Track detailed error statistics
+  track_content_types: true  # Track content type distribution
+  track_status_codes: true  # Track HTTP status code distribution
+  track_timing: true  # Track detailed timing statistics
+  stats_interval: 60  # Update detailed stats every N seconds
+
 # HTTP settings
 http:
   headers:
@@ -40,6 +57,7 @@ output:
   csv_file: "crawl_results.csv"
   json_file: "crawl_results.json"
   report_file: "crawl_report.json"
+  stats_file: "crawl_stats.json"  # New detailed statistics file
   max_headings_per_level: 5
 
 # Logging configuration
