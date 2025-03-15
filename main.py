@@ -3,7 +3,7 @@ from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 from urllib.robotparser import RobotFileParser
 import time
-from collections import deque
+from collections import deque, defaultdict
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
@@ -17,10 +17,14 @@ from datetime import datetime, timedelta
 import statistics
 import yaml
 import os
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List, Set
 import psutil
 
-# Initialize logger at module level
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 def load_config(config_path: str = "config.yaml") -> Dict[str, Any]:
@@ -48,87 +52,86 @@ def setup_logging(config: Dict[str, Any]) -> None:
     )
 
 class CrawlerStats:
-    """Class to track and manage detailed crawler statistics."""
+    """Class to track and manage crawler statistics."""
     
     def __init__(self):
-        self.start_time = datetime.now()
-        self.last_stats_update = self.start_time
-        self.pages_crawled = 0
-        self.crawl_rates = []  # pages per minute
-        self.memory_usage = []  # MB
-        self.response_times = []
-        self.errors = {
-            'timeout': 0,
-            'connection': 0,
-            'http': 0,
-            'parse': 0,
-            'other': 0
-        }
-        self.content_types = {}
-        self.status_codes = {}
-        self.timing_stats = {
-            'fetch': [],
-            'parse': [],
-            'save': []
-        }
-
-    def update_crawl_rate(self, pages_crawled: int, elapsed_seconds: float):
-        """Update pages crawled per minute."""
-        if elapsed_seconds > 0:
-            rate = (pages_crawled * 60) / elapsed_seconds
-            self.crawl_rates.append(rate)
-
-    def update_memory_usage(self):
+        self.start_time: Optional[datetime] = None
+        self.end_time: Optional[datetime] = None
+        self.last_stats_update: datetime = datetime.now()
+        self.pages_crawled: int = 0
+        self.response_times: List[float] = []
+        self.content_types: Dict[str, int] = defaultdict(int)
+        self.status_codes: Dict[int, int] = defaultdict(int)
+        self.errors: Dict[str, int] = defaultdict(int)
+        self.memory_usage: List[float] = []
+        self._last_speed_update = time.time()
+        self._speed_window = []  # pages crawled in last minute
+        self.broken_links: List[tuple] = []  # Store broken links (url, reason)
+    
+    def update_crawl_rate(self) -> float:
+        """Calculate current crawl rate (pages/minute)."""
+        current_time = time.time()
+        self._speed_window = [t for t in self._speed_window if current_time - t <= 60]
+        self._speed_window.append(current_time)
+        return len(self._speed_window)
+    
+    def update_memory_usage(self) -> float:
         """Update memory usage statistics."""
         process = psutil.Process()
         memory_mb = process.memory_info().rss / 1024 / 1024
         self.memory_usage.append(memory_mb)
-
+        return memory_mb
+    
+    def add_broken_link(self, url: str, reason: str) -> None:
+        """Add a broken link to the tracking list."""
+        self.broken_links.append((url, reason))
+    
+    def restore_from_state(self, state: Dict[str, Any]) -> None:
+        """Restore statistics from a saved state."""
+        if not state:
+            return
+            
+        stats = state.get('stats', {})
+        self.pages_crawled = stats.get('pages_crawled', 0)
+        
+        if 'start_time' in stats and stats['start_time']:
+            self.start_time = datetime.fromisoformat(stats['start_time'])
+        
+        self.response_times = stats.get('response_times', [])
+        self.content_types = defaultdict(int, stats.get('content_types', {}))
+        self.status_codes = defaultdict(int, stats.get('status_codes', {}))
+        self.errors = defaultdict(int, stats.get('errors', {}))
+        self.broken_links = stats.get('broken_links', [])
+    
     def get_summary(self) -> Dict[str, Any]:
         """Get comprehensive statistics summary."""
-        end_time = datetime.now()
-        elapsed_time = (end_time - self.start_time).total_seconds()
+        duration = None
+        if self.start_time:
+            end = self.end_time or datetime.now()
+            duration = (end - self.start_time).total_seconds()
+        
+        avg_response_time = sum(self.response_times) / len(self.response_times) if self.response_times else 0
+        avg_memory_usage = sum(self.memory_usage) / len(self.memory_usage) if self.memory_usage else 0
         
         return {
-            'timing': {
-                'start_time': self.start_time.isoformat(),
-                'end_time': end_time.isoformat(),
-                'elapsed_seconds': elapsed_time
+            'pages_crawled': self.pages_crawled,
+            'duration_seconds': duration,
+            'average_speed': self.pages_crawled / duration if duration else 0,
+            'current_speed': self.update_crawl_rate(),
+            'response_times': {
+                'average': avg_response_time,
+                'min': min(self.response_times) if self.response_times else 0,
+                'max': max(self.response_times) if self.response_times else 0
             },
-            'progress': {
-                'pages_crawled': self.pages_crawled,
-                'average_crawl_rate': statistics.mean(self.crawl_rates) if self.crawl_rates else 0,
-                'current_crawl_rate': self.crawl_rates[-1] if self.crawl_rates else 0
+            'memory_usage': {
+                'current': self.memory_usage[-1] if self.memory_usage else 0,
+                'average': avg_memory_usage,
+                'peak': max(self.memory_usage) if self.memory_usage else 0
             },
-            'performance': {
-                'memory_usage_mb': {
-                    'current': self.memory_usage[-1] if self.memory_usage else 0,
-                    'average': statistics.mean(self.memory_usage) if self.memory_usage else 0,
-                    'peak': max(self.memory_usage) if self.memory_usage else 0
-                },
-                'response_times': {
-                    'average': statistics.mean(self.response_times) if self.response_times else 0,
-                    'median': statistics.median(self.response_times) if self.response_times else 0,
-                    'p95': statistics.quantiles(self.response_times, n=20)[-1] if len(self.response_times) >= 20 else None
-                }
-            },
-            'errors': self.errors,
-            'content_types': self.content_types,
-            'status_codes': self.status_codes,
-            'timing_stats': {
-                'fetch': {
-                    'average': statistics.mean(self.timing_stats['fetch']) if self.timing_stats['fetch'] else 0,
-                    'median': statistics.median(self.timing_stats['fetch']) if self.timing_stats['fetch'] else 0
-                },
-                'parse': {
-                    'average': statistics.mean(self.timing_stats['parse']) if self.timing_stats['parse'] else 0,
-                    'median': statistics.median(self.timing_stats['parse']) if self.timing_stats['parse'] else 0
-                },
-                'save': {
-                    'average': statistics.mean(self.timing_stats['save']) if self.timing_stats['save'] else 0,
-                    'median': statistics.median(self.timing_stats['save']) if self.timing_stats['save'] else 0
-                }
-            }
+            'content_types': dict(self.content_types),
+            'status_codes': {str(k): v for k, v in self.status_codes.items()},
+            'errors': dict(self.errors),
+            'broken_links': self.broken_links
         }
 
 class SeoCrawler:
@@ -164,25 +167,181 @@ class SeoCrawler:
         # Load or initialize state
         self.state = self.load_checkpoint() if self.checkpoint_enabled else None
         if self.state:
-            self.visited = self.state['visited']
-            self.queue = self.state['queue']
-            self.stats.pages_crawled = len(self.visited)
+            self.visited = set(self.state['visited'])
+            self.queue = deque(self.state['queue'])
+            self.stats.restore_from_state(self.state)
+            logger.info(f"Restored state: {len(self.visited)} pages previously crawled")
         else:
             self.visited = set()
             self.queue = deque([self.start_url])
         
         self.lock = threading.Lock()
         self.session = requests.Session()
-        self.stats = {
-            'response_times': [],
-            'broken_links': [],
-            'content_types': {},
-            'status_codes': {},
-            'start_time': None,
-            'end_time': None
-        }
         
         self.setup_db()
+
+    def load_checkpoint(self) -> Optional[Dict[str, Any]]:
+        """Load crawler state from checkpoint file if it exists."""
+        if not self.checkpoint_enabled or not os.path.exists(self.checkpoint_file):
+            return None
+        
+        try:
+            # First try reading the main checkpoint file
+            with open(self.checkpoint_file, 'r') as f:
+                state = json.load(f)
+            
+            # Validate checkpoint data
+            required_keys = ['visited', 'queue', 'timestamp', 'crawl_status', 'stats']
+            if not all(key in state for key in required_keys):
+                raise ValueError("Checkpoint file is missing required data")
+            
+            # Check if checkpoint is too old
+            checkpoint_time = datetime.fromisoformat(state['timestamp'])
+            if (datetime.now() - checkpoint_time) > timedelta(hours=24):
+                logger.warning("Checkpoint is more than 24 hours old, consider starting fresh")
+            
+            logger.info(f"Loaded checkpoint from {state['timestamp']}")
+            logger.info(f"Crawl status: {state['crawl_status']['completion_percentage']:.1f}% complete")
+            logger.info(f"Queue size: {state['crawl_status']['remaining_urls']} URLs")
+            
+            return state
+            
+        except (json.JSONDecodeError, KeyError, ValueError) as e:
+            logger.error(f"Error loading checkpoint: {e}")
+            
+            # Try loading backup if main file is corrupted
+            backup_file = f"{self.checkpoint_file}.bak"
+            if os.path.exists(backup_file):
+                try:
+                    with open(backup_file, 'r') as f:
+                        state = json.load(f)
+                    logger.info("Successfully loaded checkpoint from backup file")
+                    return state
+                except Exception as backup_error:
+                    logger.error(f"Failed to load checkpoint backup: {backup_error}")
+            
+            return None
+
+    def save_checkpoint(self) -> None:
+        """Save current crawler state to checkpoint file."""
+        if not self.checkpoint_enabled:
+            return
+
+        state = {
+            'visited': list(self.visited),
+            'queue': list(self.queue),
+            'timestamp': datetime.now().isoformat(),
+            'crawl_status': {
+                'in_progress': True,
+                'last_url': list(self.visited)[-1] if self.visited else None,
+                'remaining_urls': len(self.queue),
+                'completion_percentage': (len(self.visited) / self.max_pages * 100) if self.max_pages else 0
+            },
+            'stats': {
+                'pages_crawled': self.stats.pages_crawled,
+                'start_time': self.stats.start_time.isoformat() if self.stats.start_time else None,
+                'response_times': self.stats.response_times,
+                'content_types': dict(self.stats.content_types),
+                'status_codes': dict(self.stats.status_codes),
+                'errors': dict(self.stats.errors),
+                'broken_links': self.stats.broken_links,
+                'memory_usage': {
+                    'current': self.stats.memory_usage[-1] if self.stats.memory_usage else 0,
+                    'peak': max(self.stats.memory_usage) if self.stats.memory_usage else 0
+                }
+            }
+        }
+        
+        # Create backup of previous checkpoint
+        if os.path.exists(self.checkpoint_file):
+            backup_file = f"{self.checkpoint_file}.bak"
+            try:
+                os.replace(self.checkpoint_file, backup_file)
+            except Exception as e:
+                logger.warning(f"Failed to create checkpoint backup: {e}")
+        
+        try:
+            # Write checkpoint atomically using temporary file
+            temp_file = f"{self.checkpoint_file}.tmp"
+            with open(temp_file, 'w') as f:
+                json.dump(state, f, indent=2)
+            os.replace(temp_file, self.checkpoint_file)
+            logger.info(f"Saved checkpoint: {len(self.visited)} pages crawled, {len(self.queue)} pages in queue")
+        except Exception as e:
+            logger.error(f"Error saving checkpoint: {e}")
+            # Try to restore backup if available
+            if os.path.exists(f"{self.checkpoint_file}.bak"):
+                try:
+                    os.replace(f"{self.checkpoint_file}.bak", self.checkpoint_file)
+                except Exception as backup_error:
+                    logger.error(f"Failed to restore checkpoint backup: {backup_error}")
+
+    def process_results(self, results: List[Dict[str, Any]]) -> None:
+        """Process crawled page results and update statistics."""
+        for result in results:
+            url = result['url']
+            
+            # Update basic statistics
+            self.stats.pages_crawled += 1
+            
+            # Update response time statistics
+            if 'response_time' in result:
+                self.stats.response_times.append(result['response_time'])
+            
+            # Update content type statistics
+            if self.progress_config['track_content_types'] and 'content_type' in result:
+                self.stats.content_types[result['content_type']] += 1
+            
+            # Update status code statistics
+            if self.progress_config['track_status_codes'] and 'status' in result:
+                self.stats.status_codes[result['status']] += 1
+            
+            # Process discovered links
+            with self.lock:
+                self.visited.add(url)
+                for link in result.get('links', []):
+                    if link not in self.visited and link not in self.queue:
+                        self.queue.append(link)
+            
+            logger.info(f"Processed: {url} (Status: {result.get('status', 'unknown')}) - {self.stats.pages_crawled}/{self.max_pages}")
+
+    def cleanup(self) -> None:
+        """Perform final cleanup tasks and save statistics."""
+        try:
+            # Close resources
+            self.session.close()
+            
+            # Save final statistics
+            self.stats.end_time = datetime.now()
+            final_stats = self.stats.get_summary()
+            
+            # Save statistics to file
+            stats_file = self.config['output']['stats_file']
+            with open(stats_file, 'w') as f:
+                json.dump(final_stats, f, indent=2)
+            logger.info(f"Final statistics saved to {stats_file}")
+            
+            # Handle checkpoint file
+            if self.checkpoint_enabled:
+                if len(self.visited) >= self.max_pages and not self.keep_checkpoint:
+                    try:
+                        os.remove(self.checkpoint_file)
+                        logger.info("Checkpoint file removed after successful completion")
+                    except OSError as e:
+                        logger.error(f"Error removing checkpoint file: {e}")
+                else:
+                    self.save_checkpoint()
+            
+            # Generate final reports
+            self.generate_report()
+            self.export_to_csv()
+            self.export_to_json()
+            
+            logger.info("Cleanup completed successfully")
+            
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}")
+            raise
 
     @staticmethod
     def normalize_url(url):
@@ -273,11 +432,18 @@ class SeoCrawler:
             response = self.session.get(url, headers=self.headers, timeout=self.timeout)
             response_time = time.time() - start_time
             
-            self.stats['response_times'].append(response_time)
-            self.stats['status_codes'][response.status_code] = self.stats['status_codes'].get(response.status_code, 0) + 1
+            # Update statistics
+            if self.progress_config['track_timing']:
+                self.stats.response_times.append(response_time)
+            
+            if self.progress_config['track_status_codes']:
+                self.stats.status_codes[response.status_code] = \
+                    self.stats.status_codes.get(response.status_code, 0) + 1
             
             content_type = response.headers.get('Content-Type', '').lower()
-            self.stats['content_types'][content_type] = self.stats['content_types'].get(content_type, 0) + 1
+            if self.progress_config['track_content_types']:
+                self.stats.content_types[content_type] = \
+                    self.stats.content_types.get(content_type, 0) + 1
 
             if not self.is_html_content(response):
                 return None
@@ -352,12 +518,16 @@ class SeoCrawler:
             return result
 
         except requests.Timeout:
-            self.stats['broken_links'].append((url, "Timeout"))
+            if self.progress_config['track_errors']:
+                self.stats.errors['timeout'] = self.stats.errors.get('timeout', 0) + 1
             return self._create_error_result(url, "Timeout Error", start_time)
         except requests.RequestException as e:
-            self.stats['broken_links'].append((url, str(e)))
+            if self.progress_config['track_errors']:
+                self.stats.errors['connection'] = self.stats.errors.get('connection', 0) + 1
             return self._create_error_result(url, str(e), start_time)
         except Exception as e:
+            if self.progress_config['track_errors']:
+                self.stats.errors['other'] = self.stats.errors.get('other', 0) + 1
             logger.error(f"Unexpected error processing {url}: {e}")
             return self._create_error_result(url, f"Unexpected Error: {str(e)}", start_time)
 
@@ -384,8 +554,11 @@ class SeoCrawler:
         """Check if URL should be skipped based on patterns."""
         return bool(self.skip_patterns.search(url))
 
-    def save_results(self, results):
+    def save_results(self, results: Optional[List[Dict[str, Any]]] = None) -> None:
         """Batch save results to the database."""
+        if not results:
+            return
+            
         with self.database_connection() as conn:
             # Save page data
             pages_columns = ["url", "status", "response_time", "content_type", "title", 
@@ -480,51 +653,38 @@ class SeoCrawler:
     def generate_report(self):
         """Generate a summary report of the crawl."""
         try:
-            start_time = datetime.fromisoformat(self.stats['start_time'])
-            end_time = datetime.fromisoformat(self.stats['end_time'])
-            duration = (end_time - start_time).total_seconds()
-        except (TypeError, ValueError) as e:
-            logger.error(f"Error calculating duration: {e}")
-            duration = 0
-
-        report = {
-            'crawl_summary': {
-                'start_time': self.stats['start_time'],
-                'end_time': self.stats['end_time'],
-                'duration_seconds': duration,
-                'pages_crawled': len(self.visited),
-                'avg_response_time': statistics.mean(self.stats['response_times']) if self.stats['response_times'] else 0,
-                'median_response_time': statistics.median(self.stats['response_times']) if self.stats['response_times'] else 0,
-                'status_codes': self.stats['status_codes'],
-                'content_types': self.stats['content_types'],
-                'broken_links_count': len(self.stats['broken_links'])
-            },
-            'broken_links': self.stats['broken_links'],
-            'configuration': self.config
-        }
-
-        report_file = self.config['output']['report_file']
-        with open(report_file, 'w') as f:
-            json.dump(report, f, indent=2)
-        
-        logger.info(f"Crawl report generated: {report_file}")
-
-    def save_checkpoint(self):
-        """Save current crawler state to checkpoint file."""
-        if not self.checkpoint_enabled:
-            return
-
-        try:
-            state = {
-                'visited': list(self.visited),
-                'queue': list(self.queue),
-                'stats': self.stats.get_summary()
+            stats_summary = self.stats.get_summary()
+            
+            report = {
+                'crawl_summary': {
+                    'start_time': self.stats.start_time.isoformat() if self.stats.start_time else None,
+                    'end_time': self.stats.end_time.isoformat() if self.stats.end_time else None,
+                    'duration_seconds': stats_summary['duration_seconds'],
+                    'pages_crawled': stats_summary['pages_crawled'],
+                    'avg_response_time': stats_summary['response_times']['average'],
+                    'status_codes': stats_summary['status_codes'],
+                    'content_types': stats_summary['content_types'],
+                    'error_count': sum(stats_summary['errors'].values())
+                },
+                'performance': {
+                    'memory_usage': stats_summary['memory_usage'],
+                    'crawl_speed': {
+                        'average': stats_summary['average_speed'],
+                        'current': stats_summary['current_speed']
+                    }
+                },
+                'errors': stats_summary['errors'],
+                'configuration': self.config
             }
-            with open(self.checkpoint_file, 'w') as f:
-                json.dump(state, f)
-            logger.info(f"Checkpoint saved: {len(self.visited)} pages crawled")
+
+            report_file = self.config['output']['report_file']
+            with open(report_file, 'w') as f:
+                json.dump(report, f, indent=2)
+            
+            logger.info(f"Crawl report generated: {report_file}")
+            
         except Exception as e:
-            logger.error(f"Error saving checkpoint: {e}")
+            logger.error(f"Error generating report: {e}")
 
     def update_stats(self):
         """Update detailed statistics."""
@@ -536,7 +696,7 @@ class SeoCrawler:
         
         if elapsed >= self.stats_interval:
             if self.progress_config['track_speed']:
-                self.stats.update_crawl_rate(self.stats.pages_crawled, elapsed)
+                self.stats.update_crawl_rate()
             
             if self.progress_config['track_memory']:
                 self.stats.update_memory_usage()
@@ -548,111 +708,86 @@ class SeoCrawler:
                 json.dump(self.stats.get_summary(), f, indent=2)
 
     def crawl(self):
-        """Main crawl loop with enhanced progress tracking and configurable checkpoints."""
+        """Start the crawling process."""
+        logger.info(f"Starting crawl from {self.start_url}")
         if not self.stats.start_time:
             self.stats.start_time = datetime.now()
+        last_checkpoint = time.time()
+        last_stats_update = time.time()
         
-        pages_since_checkpoint = 0
-        
-        with tqdm(total=self.max_pages, desc="Crawling", unit="page", 
-                 initial=len(self.visited)) as pbar:
-            while self.queue and len(self.visited) < self.max_pages:
-                with self.lock:
-                    batch_size = min(self.max_workers, len(self.queue), self.max_pages - len(self.visited))
-                    batch = [self.queue.popleft() for _ in range(batch_size) if self.queue]
+        # Initialize progress bar
+        progress = tqdm(
+            total=self.max_pages,
+            initial=len(self.visited),
+            desc="Crawling",
+            unit="pages"
+        )
 
-                urls_to_crawl = []
-                for url in batch:
-                    if url not in self.visited and self.can_fetch(url):
-                        urls_to_crawl.append(url)
-                    else:
-                        with self.lock:
-                            self.visited.add(url)
-
-                if not urls_to_crawl:
-                    continue
-
-                with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                    future_to_url = {executor.submit(self.fetch_page, url): url for url in urls_to_crawl}
-                    for future in as_completed(future_to_url):
-                        url = future_to_url[future]
+        try:
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                while self.queue and len(self.visited) < self.max_pages:
+                    current_time = time.time()
+                    
+                    # Save checkpoint if interval elapsed
+                    if self.checkpoint_enabled and (current_time - last_checkpoint) >= (self.checkpoint_interval * self.delay):
+                        self.save_checkpoint()
+                        last_checkpoint = current_time
+                    
+                    # Update statistics if interval elapsed
+                    if current_time - last_stats_update >= self.stats_interval:
+                        self.update_stats()
+                        last_stats_update = current_time
+                    
+                    # Get next batch of URLs to process
+                    batch_size = min(self.batch_size, self.max_pages - len(self.visited))
+                    urls_to_process = []
+                    while len(urls_to_process) < batch_size and self.queue:
+                        url = self.queue.popleft()
+                        if url not in self.visited:
+                            urls_to_process.append(url)
+                    
+                    if not urls_to_process:
+                        continue
+                    
+                    # Process batch of URLs
+                    futures = [executor.submit(self.fetch_page, url) for url in urls_to_process]
+                    results = []
+                    for future in as_completed(futures):
                         try:
                             result = future.result()
-                            if result:  # Only process if result is not None
-                                self.stats.pages_crawled += 1
-                                pages_since_checkpoint += 1
-                                
-                                if self.progress_config['track_content_types']:
-                                    content_type = result['content_type']
-                                    self.stats.content_types[content_type] = \
-                                        self.stats.content_types.get(content_type, 0) + 1
-                                
-                                if self.progress_config['track_status_codes']:
-                                    status = result['status']
-                                    self.stats.status_codes[status] = \
-                                        self.stats.status_codes.get(status, 0) + 1
-                                
-                                if self.progress_config['track_timing']:
-                                    self.stats.response_times.append(result['response_time'])
-
-                                with self.lock:
-                                    self.visited.add(url)
-                                    for link in result["links"]:
-                                        if link not in self.visited and link not in self.queue:
-                                            self.queue.append(link)
-                                pbar.update(1)
-                                logger.info(f"Crawled: {url} (Status: {result['status']}) - {self.stats.pages_crawled}/{self.max_pages}")
+                            if result:
+                                results.append(result)
+                                progress.update(1)
                         except Exception as e:
-                            logger.error(f"Error processing {url}: {e}")
+                            logger.error(f"Error processing future: {e}")
+                    
+                    if results:
+                        self.process_results(results)
+                        self.save_results(results)
+                    
+                    time.sleep(self.delay)  # Respect crawl delay
 
-                # Save results to database
-                if urls_to_crawl:
-                    self.save_results(urls_to_crawl)
-
-                # Update statistics
-                self.update_stats()
-
-                # Save checkpoint if needed
-                if self.checkpoint_enabled and pages_since_checkpoint >= self.checkpoint_interval:
-                    self.save_checkpoint()
-                    pages_since_checkpoint = 0
-
-                time.sleep(self.delay)
-
-        # Final cleanup and statistics
-        self.cleanup()
-
-    def cleanup(self):
-        """Enhanced cleanup with final statistics and configurable checkpoint handling."""
-        try:
-            self.session.close()
-            
-            # Save final statistics
-            self.stats.end_time = datetime.now()
-            final_stats = self.stats.get_summary()
-            
-            with open(self.config['output']['stats_file'], 'w') as f:
-                json.dump(final_stats, f, indent=2)
-            
-            # Save final checkpoint if enabled
-            if self.checkpoint_enabled:
-                self.save_checkpoint()
-                
-                # Remove checkpoint file if crawl completed successfully and keep_checkpoint is False
-                if len(self.visited) >= self.max_pages and not self.keep_checkpoint:
-                    try:
-                        os.remove(self.checkpoint_file)
-                        logger.info("Crawl completed successfully, checkpoint file removed")
-                    except OSError:
-                        pass
-            
-            # Generate reports and exports
-            self.generate_report()
-            self.export_to_csv()
-            self.export_to_json()
-            
+        except KeyboardInterrupt:
+            logger.info("Crawl interrupted by user")
+            self.save_checkpoint()  # Save checkpoint on interrupt
+            raise
         except Exception as e:
-            logger.error(f"Error during cleanup: {e}")
+            logger.error(f"Crawl failed: {e}")
+            self.save_checkpoint()  # Save checkpoint on error
+            raise
+        finally:
+            progress.close()
+            self.stats.end_time = datetime.now()
+            self.update_stats()
+            self.generate_report()
+            
+            # Clean up checkpoint file if crawl completed successfully
+            if self.checkpoint_enabled and not self.keep_checkpoint and len(self.visited) >= self.max_pages:
+                try:
+                    os.remove(self.checkpoint_file)
+                    logger.info("Checkpoint file removed after successful completion")
+                except Exception as e:
+                    logger.error(f"Error removing checkpoint file: {e}")
 
 def main():
     """Main function to run the crawler."""
