@@ -1,0 +1,49 @@
+# Crawler Configuration
+
+# Target website configuration
+target:
+  start_url: "https://example.com"
+  max_pages: 100
+  keyword: null  # Optional keyword for analysis
+
+# Performance settings
+performance:
+  delay: 0.5  # Delay between requests in seconds
+  max_workers: 5  # Maximum number of concurrent threads
+  timeout: 30  # Request timeout in seconds
+  batch_size: 50  # Database batch size
+
+# HTTP settings
+http:
+  headers:
+    User-Agent: "SeoCrawler/1.0 (+https://example.com/crawler-info)"
+    Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
+    Accept-Language: "en-US,en;q=0.5"
+  skip_patterns:
+    - "\\.css$"
+    - "\\.js$"
+    - "\\.jpg$"
+    - "\\.jpeg$"
+    - "\\.png$"
+    - "\\.gif$"
+    - "\\.ico$"
+    - "\\.pdf$"
+    - "\\.doc$"
+    - "\\.docx$"
+    - "\\.zip$"
+    - "\\.rar$"
+    - "\\.xml$"
+
+# Output settings
+output:
+  database_file: "crawl_results.db"
+  csv_file: "crawl_results.csv"
+  json_file: "crawl_results.json"
+  report_file: "crawl_report.json"
+  max_headings_per_level: 5
+
+# Logging configuration
+logging:
+  level: "INFO"
+  format: "%(asctime)s [%(levelname)s] %(message)s"
+  file: "crawler.log"  # Optional file logging
